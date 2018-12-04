@@ -36,13 +36,16 @@ class controlServer:
         #     for s in readable:
         #         if s is self.mySocket.get_socket():
         #             print('Get a connection')
+        #             print(len(readable))
         #             conn, addr = self.mySocket.accept()     # 当有client请求时，创建一个新套接字，由该client专用
-        #             read_list.append(conn)
+        #             read_list.append(conn.get_socket())
         #         else:
+        #             print('......')
         #             if self.interface(s) == False:
         #                 s.close()
         #                 read_list.remove(s)                    # 两台主机之间传输控制信息的接口
         # # conn.close()                            # 关闭套接字
+
 
     # 接受client的上传命令后的处理
     def clientUpload(self, conn, size, name):

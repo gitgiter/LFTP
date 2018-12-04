@@ -14,7 +14,7 @@ class mysocket:
         self.__base = 0
         self.__sndpkt_buffer_size = 16
         self.__sndpkt_buffer = {}
-        self.__rcvpkt_buffer_size = 16
+        self.__rcvpkt_buffer_size = 256
         self.__rcvpkt_buffer = {}
         self.__local_addr = ('localhost', 12000)
         self.__remote_addr = remote_addr
@@ -77,7 +77,7 @@ class mysocket:
 
     def listen(self, num):
         listen = threading.Thread(target=self.sub_listen, args=(num,))
-        listen.start()    
+        listen.start()
 
     def sub_listen(self, num):
         # print('===== listen begin =====')
@@ -157,7 +157,7 @@ class mysocket:
         n = math.ceil(len(data) / self.__mss)
         while n > self.__remote_rwnd:
             # wait and check rwnd later
-            time.sleep(0.5)
+            # time.sleep(0.5)
             snd_pkt = utils.packet()
             snd_pkt.rwnd_check = 1
             snd_pkt = snd_pkt.make_pkt()
@@ -297,7 +297,7 @@ class mysocket:
         #             break
         sleep_count = 10
         while len(self.__rcvpkt_buffer) < size:
-            time.sleep(0.5)
+            # time.sleep(0.5)
             sleep_count -= 1            
             if sleep_count < 0:
                 if len(self.__rcvpkt_buffer) > 0:
