@@ -6,8 +6,9 @@ import multiprocessing
 import threading
 import select
 
-HOST = '127.0.0.1'
+# HOST = '127.0.0.1'
 # HOST = '192.168.199.154'
+HOST = '172.18.35.238'
 FTPPORT = 3154
 PATH = os.path.dirname(os.path.abspath(__file__))+'\\Server\\' # FTP_Server.py的同级目录中的Server目录
 
@@ -36,16 +37,13 @@ class controlServer:
         #     for s in readable:
         #         if s is self.mySocket.get_socket():
         #             print('Get a connection')
-        #             print(len(readable))
         #             conn, addr = self.mySocket.accept()     # 当有client请求时，创建一个新套接字，由该client专用
-        #             read_list.append(conn.get_socket())
+        #             read_list.append(conn)
         #         else:
-        #             print('......')
         #             if self.interface(s) == False:
         #                 s.close()
         #                 read_list.remove(s)                    # 两台主机之间传输控制信息的接口
         # # conn.close()                            # 关闭套接字
-
 
     # 接受client的上传命令后的处理
     def clientUpload(self, conn, size, name):
@@ -198,8 +196,8 @@ def DataConn(*args):
         if not datas.empty():
             data = datas.get()
             print('Starting Transfer :')
-            print(' port: %s'%data['action'])
-            print(' action: %s'%data['port'])
+            print(' port: %s'%data['port'])
+            print(' action: %s'%data['action'])
             print(' filename: %s'%data['extra'])
             print(' filesize: %s KB'%(int(data['filesize'])/1024))            
             x = threading.Thread(target = open_server, args = [ports, data['port'], data['action'], data['extra'], data['filesize']])

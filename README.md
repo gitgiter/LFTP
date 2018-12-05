@@ -213,7 +213,7 @@ def sub_listen(self, num):
             snd_pkt.srcPort = self.__local_addr[1] + 10 * (self.__client_count + 1)
             new_client_sock = mysocket(remote_addr=remote_addr)
             self.__client_sock[remote_addr] = new_client_sock
-            new_client_sock.bind(('localhost', snd_pkt.srcPort))
+            new_client_sock.bind((self.__local_addr[0], snd_pkt.srcPort))
             snd_pkt = snd_pkt.make_pkt()
             self.__sock.sendto(snd_pkt, remote_addr)
             # self.rdt_send(snd_pkt)
@@ -234,10 +234,6 @@ def accept(self):
     keys = list(self.__client_sock.keys())
     return (self.__client_sock.pop(keys[0]), keys[0])
 ```
-- send。使用了回退n的机制，将用户传进来的data进行进一步分片，如果分片数大于缓存，则不发送，以及如果分片数大于对方的rwnd也不发送。回退n循环调用rdt_send方法，rdt_send方法判断当前要发送的seq是否在窗口可发送内的返回。
-
-- recv。中间启动子线程循环接收包。接收到的包放到缓存中，每次被读出来的时候，清除缓存中的对应项。
-
 - 拥塞控制  
 拥塞控制算法主要包括慢启动、拥塞避免和快速恢复。  
 TCP中维护两个变量：cwnd和ssthresh，一个是拥塞窗口，一个是慢启动阈值。cwnd初始为1，ssthresh初始为8。  
@@ -271,6 +267,178 @@ while True:
             self.__ssthresh = math.floor(self.__ssthresh / 2)   
             return False
         continue
+```
+- 流控。发送的包中有一个属性是rwnd，在接收方每次接收到一个包时，计算自己当前剩余的缓存空间，将计算结果通过rwnd传回给发送方，发送方根据返回的rwnd决定是否进行发包。如果接收方返回的rwnd过小，发送方会先暂停发送，然后每过一段时间发一个带有rwnd_check的包去询问接收方是否有新的缓存空间。
+
+- send。使用了回退n的机制，将用户传进来的data进行进一步分片，如果分片数大于缓存，则不发送，以及如果分片数大于对方的rwnd也不发送。回退n循环调用rdt_send方法，rdt_send方法判断当前要发送的seq是否在窗口可发送内的返回。
+**注：发送缓存和接收缓存都是使用自定义的packet类型作为单位，而不是字节。**
+```python
+# return true or block to timeout
+def send(self, data):
+    # print('===== send begin =====')
+    # print('send buffer used:', len(self.__sndpkt_buffer), '(before send)')
+
+    pkt_num = math.ceil(len(data) / self.__mss)    
+    pkt_count = 0            
+    while pkt_count < pkt_num:
+        if self.__cwnd < pkt_num - pkt_count:
+            n = self.__cwnd
+        else:
+            n = pkt_num - pkt_count
+        ack_count = 0  
+
+        while n > self.__remote_rwnd:
+            # wait and check rwnd later
+            time.sleep(0.5)
+            snd_pkt = utils.packet()
+            snd_pkt.rwnd_check = 1
+            snd_pkt = snd_pkt.make_pkt()
+            self.__sock.sendto(snd_pkt, self.__remote_addr)
+
+            try:
+                recv_pkt, remote_addr = self.__sock.recvfrom(2048)
+                recv_pkt = utils.extract_pkt(recv_pkt)
+            except:
+                if recv_pkt.rwnd_check == 1:
+                    if n <= recv_pkt.rwnd:
+                        self.__remote_rwnd = recv_pkt.rwnd
+                        break
+
+        if n > self.__sndpkt_buffer_size:
+            print('data too long, please make it smaller and resend')
+            return False         
+
+        for i in range(n):
+            snd_pkt = utils.packet()
+            snd_pkt.seqNum = self.__seq_num  
+            snd_pkt.data = data[i*self.__mss : (i+1)*self.__mss]
+            while self.rdt_send(snd_pkt) == False:
+                pass
+
+        try_count = 3 # max resend times
+        while True:
+            try:
+                # recv_pkt, remote_addr = self.rdt_recv()   
+                recv_pkt, remote_addr = self.__sock.recvfrom(2048)
+                recv_pkt = utils.extract_pkt(recv_pkt)
+            except Exception as e:
+                # receive timeout: resend
+                # print(e)
+                for i in range(self.__base, self.__seq_num):
+                    # resend the packet that not ack
+                    self.__sock.sendto(self.__sndpkt_buffer[i], self.__remote_addr)
+                # print('send: timeout, not enough ACKs received, resended data to (%s:%s)' % self.__remote_addr)
+                try_count -= 1
+                if try_count < 0:
+                    # print('send: fail to send data to (%s:%s)' % self.__remote_addr)
+                    self.__cwnd = math.floor(self.__cwnd / 2)
+                    self.__ssthresh = math.floor(self.__ssthresh / 2)   # fast recovery
+                    return False
+                continue
+            
+            if recv_pkt.ack == 1:
+                # print('send: received ACK from (%s:%s)' % remote_addr)
+                self.__base = recv_pkt.ackNum + 1
+                self.__remote_rwnd = recv_pkt.rwnd
+                pkt_count += 1                    
+                ack_count += 1
+                if self.__cwnd < self.__ssthresh:
+                    self.__cwnd += 1    # slow start
+                elif self.__cwnd >= self.__ssthresh and ack_count == n:
+                    self.__cwnd += 1    # congestion avoidance                            
+
+                if self.__base == self.__seq_num:
+                    self.__sndpkt_buffer.clear()
+                    break
+        
+    # print('===== send end =====\n')
+    return True
+```
+
+- recv。第一次执行该方法的时候启动子线程sub_recv循环接收包。sub_recv将接收到的有用的包放到缓存中，seqNum不符合预期的直接丢弃。recv则由上层调用者指定一个size，size是要读出来包的个数，如果缓存中有足够的包，则直接将这些包从缓存中读出来，返回给上层调用者，并清除缓存中的对应项。如果缓存中的包不足size个，则等待一段时间看是否可以接收到size个包，如果接收不到则判断当前缓存中是否有包，有包则返回所有的包，没有则阻塞等待。
+```python
+# return: packet object or block to timeout
+def sub_recv(self):
+    if len(self.__rcvpkt_buffer) > self.__rcvpkt_buffer_size:
+        print('recv: buffer full')
+        # return None, None
+
+    while True:
+        try:
+            # remote_addr is a tuple (ip, port)
+            recv_pkt, remote_addr = self.__sock.recvfrom(2048)
+            recv_pkt = utils.extract_pkt(recv_pkt)
+        except Exception as e:                
+            # no packet received
+            # print('recv: idle...')
+            continue
+            # return None, None
+            
+        if recv_pkt.rwnd_check == 1:
+            snd_pkt = utils.packet()
+            snd_pkt.ack = 1
+            snd_pkt.rwnd_check = 1                             
+            snd_pkt.rwnd = self.__rcvpkt_buffer_size - len(self.__rcvpkt_buffer)
+            snd_pkt = snd_pkt.make_pkt()
+            self.__sock.sendto(snd_pkt, remote_addr)
+            print('recv: check rwnd')
+        elif recv_pkt.ack == 0:
+            # print('recv: received packet from (%s:%s)' % remote_addr)
+            snd_pkt = utils.packet()
+            snd_pkt.ack = 1
+            snd_pkt.ackNum = recv_pkt.seqNum
+            snd_pkt.rwnd = self.__rcvpkt_buffer_size - len(self.__rcvpkt_buffer)
+            snd_pkt = snd_pkt.make_pkt()
+            self.__sock.sendto(snd_pkt, remote_addr)
+            # print('recv: sended ACK to (%s:%s)' % remote_addr)
+            if recv_pkt.seqNum == self.__ack_num:
+                self.__rcvpkt_buffer[recv_pkt.seqNum] = recv_pkt
+                self.__ack_num += 1
+            
+    # return recv_pkt, remote_addr
+
+def rdt_recv(self):
+    if self.__recv_started == False:
+        recv = threading.Thread(target=self.sub_recv)
+        recv.start()
+        self.__recv_started = True
+
+def recv(self, size):
+    # print('\n===== receive begin =====')        
+
+    if size > self.__rcvpkt_buffer_size:
+        print('recv: read too much')
+        return None
+
+    if size == 0:
+        print('recv: read too less')
+
+    self.rdt_recv()
+    
+    sleep_count = 10
+    while len(self.__rcvpkt_buffer) < size:
+        time.sleep(0.5)
+        sleep_count -= 1            
+        if sleep_count < 0:
+            if len(self.__rcvpkt_buffer) > 0:
+                break
+            else:
+                sleep_count += 1
+        pass
+
+    data = b''
+    length = len(self.__rcvpkt_buffer)
+    read_count = 0
+    keys = list(self.__rcvpkt_buffer.keys())
+    for i in range(length):
+        if read_count >= size or read_count >= length:
+            break
+        temp = self.__rcvpkt_buffer.pop(keys[i])
+        data += temp.data
+        read_count += 1
+    
+    # print('===== receive end =====\n')
+    return data
 ```
 
 ## 2.5 FTP内部实现
@@ -432,7 +600,7 @@ def dataUpload(self, conn):
 - Server和Client确保可以相互ping通（关掉防火墙）
 
 - 客户端需要先安装progressbar库，显示进度条
-	pip install progressbar
+    pip install progressbar
 
 - Server需要修改FTP_server.py中的HOST为ip地址（可以为localhost）,默认的链接端口FTPPORT为3154，也可更改为其他可用端口
 
@@ -442,8 +610,26 @@ def dataUpload(self, conn):
 
 # 4. 测试
 
-## 4.1 上传文件
-## 4.2 下载文件
-## 4.3 流控制
-## 4.4 拥塞控制
-## 4.5 多客户端
+## 4.1 上传文件  
+客户端输入上传命令，指定上传文件的绝对路径。  
+服务端接收到来自客户端的命令，返回一个可用端口9000，让客户端连接该端口并进行数据传输。  
+![服务端响应上传操作](img/server_upload.png)  
+客户端开始上传文件  
+![上传文件](img/upload0.png)  
+客户端继续上传文件（进度条更新）  
+![上传文件2](img/upload1.png)  
+上传文件成功  
+![上传成功](img/uploadComplete.png)  
+上传时，如果LFTP_Server.py的同目录下不存在'Server'文件夹，则会新建一个，上传的文件将会存放在该文件夹中。  
+![上传结果](img/result.png)
+
+## 4.2 下载文件  
+客户端输入下载命令，指定服务端中Server目录下已存在的一个文件。  
+服务端接收到来自客户端的命令，返回一个可用端口，让客户端连接该端口并进行数据传输。  
+![服务器响应下载操作](img/server_download.png)  
+客户端开始下载文件  
+![下载文件](img/download.png)
+客户端下载文件成功  
+![下载成功](img/downloadComplete.png)
+下载后，文件将会存放在LFTP_Client.py的同目录下的'Download'文件夹。  
+![下载结果](img/result2.png)
